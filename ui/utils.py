@@ -9,7 +9,6 @@ from agno.document.reader.docx_reader import DocxReader
 from agno.document.reader.pdf_reader import PDFReader
 from agno.document.reader.text_reader import TextReader
 from agno.document.reader.website_reader import WebsiteReader
-from agno.models.response import ToolExecution
 from agno.utils.log import logger
 
 
@@ -59,7 +58,7 @@ async def add_message(
     agent_name: str,
     role: str,
     content: str,
-    tool_calls: Optional[Union[List[Dict[str, Any]], List[ToolExecution]]] = None,
+    tool_calls: Optional[List[Dict[str, Any]]] = None,
 ) -> None:
     """Safely add a message to the Agent's session state."""
     # if role == "user":
@@ -82,12 +81,14 @@ def display_tool_calls(tool_calls_container, tools):
     try:
         with tool_calls_container.container():
             for tool_call in tools:
-                if isinstance(tool_call, ToolExecution):
+                if hasattr(tool_call, 'tool_name'):
+                    # Handle object with attributes
                     tool_name = tool_call.tool_name
                     tool_args = tool_call.tool_args
-                    content = tool_call.result if tool_call.result else None
+                    content = tool_call.result if hasattr(tool_call, 'result') else None
                     metrics = getattr(tool_call, "metrics", None)
                 else:
+                    # Handle dictionary
                     tool_name = tool_call.get("tool_name", "Unknown Tool")
                     tool_args = tool_call.get("tool_args", {})
                     content = tool_call.get("content")
@@ -198,186 +199,125 @@ async def knowledge_widget(agent_name: str, agent: Agent) -> None:
         if "file_uploader_key" not in st.session_state:
             st.session_state[agent_name]["file_uploader_key"] = 100
         uploaded_file = st.sidebar.file_uploader(
-            "Add a Document (.pdf, .csv, .txt, or .docx)",
+            "Add Document to Knowledge Base",
+            type=["pdf", "docx", "txt", "csv"],
             key=st.session_state[agent_name]["file_uploader_key"],
         )
         if uploaded_file is not None:
-            alert = st.sidebar.info("Processing document...", icon="🧠")
-            document_name = uploaded_file.name.split(".")[0]
-            if f"{document_name}_uploaded" not in st.session_state:
-                file_type = uploaded_file.name.split(".")[-1].lower()
+            alert = st.sidebar.info("Processing document...", icon="ℹ️")
+            if f"{uploaded_file.name}_uploaded" not in st.session_state:
+                try:
+                    # Determine the appropriate reader based on file type
+                    if uploaded_file.name.endswith(".pdf"):
+                        reader: Reader = PDFReader()
+                    elif uploaded_file.name.endswith(".docx"):
+                        reader = DocxReader()
+                    elif uploaded_file.name.endswith(".csv"):
+                        reader = CSVReader()
+                    else:
+                        reader = TextReader()
 
-                reader: Reader
-                if file_type == "pdf":
-                    reader = PDFReader()
-                elif file_type == "csv":
-                    reader = CSVReader()
-                elif file_type == "txt":
-                    reader = TextReader()
-                elif file_type == "docx":
-                    reader = DocxReader()
-                else:
-                    st.sidebar.error("Unsupported file type")
-                    return
-                uploaded_file_documents: List[Document] = reader.read(uploaded_file)
-                if uploaded_file_documents:
-                    agent.knowledge.load_documents(uploaded_file_documents, upsert=True)
-                else:
-                    st.sidebar.error("Could not read document")
-                st.session_state[f"{document_name}_uploaded"] = True
+                    # Read the document
+                    documents: List[Document] = reader.read(uploaded_file)
+                    if documents:
+                        agent.knowledge.load_documents(documents, upsert=True)
+                        st.sidebar.success(f"✅ {uploaded_file.name} added to knowledge base!")
+                    else:
+                        st.sidebar.error(f"❌ Could not read {uploaded_file.name}")
+                    st.session_state[f"{uploaded_file.name}_uploaded"] = True
+                except Exception as e:
+                    st.sidebar.error(f"❌ Error processing {uploaded_file.name}: {str(e)}")
             alert.empty()
-
-        # Load and delete knowledge
-        if st.sidebar.button("🗑️ Delete Knowledge"):
-            agent.knowledge.delete()
-            st.sidebar.success("Knowledge deleted!")
 
 
 async def session_selector(agent_name: str, agent: Agent, get_agent: Callable, user_id: str, model_id: str) -> None:
-    """Display a session selector in the sidebar, if a new session is selected, the agent is restarted with the new session."""
+    """Display a session selector in the sidebar."""
+    with st.sidebar:
+        st.markdown("#### :gear: Session Management")
+        col1, col2 = st.columns(2)
+        with col1:
+            if st.button("🔄 New Session"):
+                restart_agent(agent_name)
+        with col2:
+            if st.button("��️ Clear History"):
+                if agent_name in st.session_state:
+                    st.session_state[agent_name]["messages"] = []
+                st.rerun()
 
-    if not agent.storage:
-        return
-
-    try:
-        # Get all agent sessions.
-        agent_sessions = agent.storage.get_all_sessions()
-        if not agent_sessions:
-            st.sidebar.info("No saved sessions found.")
-            return
-
-        # Get session names if available, otherwise use IDs.
-        sessions_list = []
-        for session in agent_sessions:
-            session_id = session.session_id
-            session_name = session.session_data.get("session_name", None) if session.session_data else None
-            display_name = session_name if session_name else session_id
-            sessions_list.append({"id": session_id, "display_name": display_name})
-
-        # Display session selector.
-        st.sidebar.markdown("#### 💬 Session")
-        selected_session = st.sidebar.selectbox(
-            "Session",
-            options=[s["display_name"] for s in sessions_list],
-            key="session_selector",
-            label_visibility="collapsed",
-        )
-        # Find the selected session ID.
-        selected_session_id = next(s["id"] for s in sessions_list if s["display_name"] == selected_session)
-        # Update the agent session if it has changed.
-        if st.session_state[agent_name]["session_id"] != selected_session_id:
-            logger.info(f"---*--- Loading {agent_name} session: {selected_session_id} ---*---")
-            st.session_state[agent_name]["agent"] = get_agent(
-                user_id=user_id,
-                model_id=model_id,
-                session_id=selected_session_id,
+        # Export chat history
+        if agent_name in st.session_state and st.session_state[agent_name]["messages"]:
+            chat_history = export_chat_history(agent_name)
+            st.download_button(
+                label="📥 Export Chat",
+                data=chat_history,
+                file_name=f"{agent_name}_chat_history.md",
+                mime="text/markdown",
             )
-            st.rerun()
 
-        # Show the rename session widget.
-        container = st.sidebar.container()
-        session_row = container.columns([3, 1], vertical_alignment="center")
-
-        # Initialize session_edit_mode if needed.
-        if "session_edit_mode" not in st.session_state:
-            st.session_state.session_edit_mode = False
-
-        # Show the session name.
-        with session_row[0]:
-            if st.session_state.session_edit_mode:
-                new_session_name = st.text_input(
-                    "Session Name",
-                    value=agent.session_name,
-                    key="session_name_input",
-                    label_visibility="collapsed",
-                )
-            else:
-                st.markdown(f"Session Name: **{agent.session_name}**")
-
-        # Show the rename session button.
-        with session_row[1]:
-            if st.session_state.session_edit_mode:
-                if st.button("✓", key="save_session_name", type="primary"):
-                    if new_session_name:
-                        agent.rename_session(new_session_name)
-                        st.session_state.session_edit_mode = False
-                        container.success("Renamed!")
-                        # Trigger a rerun to refresh the sessions list
-                        st.rerun()
-            else:
-                if st.button("✎", key="edit_session_name"):
-                    st.session_state.session_edit_mode = True
-    except Exception as e:
-        logger.error(f"Error in session selector: {str(e)}")
-        st.sidebar.error("Failed to load sessions")
+        # Session ID display
+        if agent_name in st.session_state and st.session_state[agent_name]["session_id"]:
+            st.markdown(f"**Session ID:** `{st.session_state[agent_name]['session_id']}`")
 
 
 def export_chat_history(agent_name: str):
-    """Export chat history in markdown format.
+    """Export chat history as markdown."""
+    if agent_name not in st.session_state:
+        return ""
 
-    Returns:
-        str: Formatted markdown string of the chat history
-    """
-    if "messages" not in st.session_state[agent_name] or not st.session_state[agent_name]["messages"]:
-        return f"# {agent_name} - Chat History\n\nNo messages to export."
+    messages = st.session_state[agent_name]["messages"]
+    chat_text = f"# {agent_name.title()} Chat History\n\n"
+    chat_text += f"**Date:** {st.session_state[agent_name].get('session_id', 'Unknown')}\n\n"
 
-    chat_text = f"# {agent_name} - Chat History\n\n"
-    for msg in st.session_state[agent_name]["messages"]:
-        role_label = "🤖 Assistant" if msg["role"] == "assistant" else "👤 User"
-        chat_text += f"### {role_label}\n{msg['content']}\n\n"
-
-        # Include tool calls if present
-        if msg.get("tool_calls"):
-            chat_text += "#### Tool Calls:\n"
-            for i, tool_call in enumerate(msg["tool_calls"]):
-                if isinstance(tool_call, ToolExecution):
-                    tool_name = tool_call.tool_name
-                    chat_text += f"**{i + 1}. {tool_name}**\n\n"
-                    if tool_call.tool_args is not None:
-                        chat_text += f"Arguments: ```json\n{tool_call.tool_args}\n```\n\n"
-                    if tool_call.result is not None:
-                        chat_text += f"Results: ```\n{tool_call.result}\n```\n\n"
-                else:
-                    tool_name = tool_call.get("name", "Unknown Tool")
-                    chat_text += f"**{i + 1}. {tool_name}**\n\n"
-                    if "arguments" in tool_call:
-                        chat_text += f"Arguments: ```json\n{tool_call['arguments']}\n```\n\n"
-                    if "content" in tool_call:
-                        chat_text += f"Results: ```\n{tool_call['content']}\n```\n\n"
+    for msg in messages:
+        role = msg.get("role", "unknown")
+        content = msg.get("content", "")
+        
+        if role == "user":
+            chat_text += f"## �� User\n\n{content}\n\n"
+        elif role == "assistant":
+            chat_text += f"## 🤖 {agent_name.title()}\n\n{content}\n\n"
+            
+            # Add tool calls if present
+            if msg.get("tool_calls"):
+                chat_text += "#### Tool Calls:\n"
+                for i, tool_call in enumerate(msg["tool_calls"]):
+                    if hasattr(tool_call, 'tool_name'):
+                        tool_name = tool_call.tool_name
+                        chat_text += f"**{i + 1}. {tool_name}**\n\n"
+                    else:
+                        tool_name = tool_call.get("tool_name", "Unknown Tool")
+                        chat_text += f"**{i + 1}. {tool_name}**\n\n"
+                        
+                        # Add tool arguments if available
+                        tool_args = tool_call.get("tool_args", {})
+                        if tool_args:
+                            chat_text += f"**Arguments:**\n```json\n{tool_args}\n```\n\n"
+                        
+                        # Add tool results if available
+                        tool_content = tool_call.get("content")
+                        if tool_content:
+                            chat_text += f"**Results:**\n```\n{tool_content}\n```\n\n"
 
     return chat_text
 
 
 async def utilities_widget(agent_name: str, agent: Agent) -> None:
-    """Display a utilities widget in the sidebar."""
-    st.sidebar.markdown("#### 🛠️ Utilities")
-    col1, col2 = st.sidebar.columns(2)
-    with col1:
-        if st.button("🔄 Start New Chat"):
+    """Display utilities widget in the sidebar."""
+    with st.sidebar:
+        st.markdown("#### :wrench: Utilities")
+        if st.button("🔄 Restart Agent"):
             restart_agent(agent_name)
-    with col2:
-        fn = f"{agent_name}_chat_history.md"
-        if "session_id" in st.session_state[agent_name]:
-            fn = f"{agent_name}_{st.session_state[agent_name]['session_id']}.md"
-        if st.download_button(
-            ":file_folder: Export Chat History",
-            export_chat_history(agent_name),
-            file_name=fn,
-            mime="text/markdown",
-        ):
-            st.sidebar.success("Chat history exported!")
+            st.rerun()
 
 
 def restart_agent(agent_name: str):
-    logger.debug("---*--- Restarting Agent ---*---")
-    st.session_state[agent_name]["agent"] = None
-    st.session_state[agent_name]["session_id"] = None
-    st.session_state[agent_name]["messages"] = []
-    if "url_scrape_key" in st.session_state[agent_name]:
-        st.session_state[agent_name]["url_scrape_key"] += 1
-    if "file_uploader_key" in st.session_state[agent_name]:
-        st.session_state[agent_name]["file_uploader_key"] += 1
-    st.rerun()
+    """Restart the agent by clearing session state."""
+    if agent_name in st.session_state:
+        st.session_state[agent_name] = {
+            "agent": None,
+            "session_id": None,
+            "messages": [],
+        }
 
 
 async def about_agno():
